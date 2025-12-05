@@ -1,0 +1,81 @@
+## scRNA
+library(Seurat)
+library(harmony)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(reshape2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+samples<-list.files('./GSE271852')
+seurat_list<-list()
+for (sample in samples) {
+  data.path <- paste0("./GSE271852/", sample)
+  seurat_data <- Read10X(data.dir = data.path)
+  seurat_obj <- CreateSeuratObject(counts = seurat_data,project = sample,min.features = 200,
+                                   min.cells = 3)
+  seurat_list <- append(seurat_list, seurat_obj)
+}
+seurat_combined <- merge(seurat_list[[1]], 
+                         y = seurat_list[-1],
+                         add.cell.ids = samples)
+seurat_combined<-JoinLayers(seurat_combined)
+srat<-subset(seurat_combined,downsample=10000)
+srat[["percent.mt"]] <- PercentageFeatureSet(srat, pattern = "^MT-")
+VlnPlot(srat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+FeatureScatter(srat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+FeatureScatter(srat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+srat <- subset(srat, subset = nCount_RNA < 20000 & nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 10)
+srat <- NormalizeData(srat)
+srat <- FindVariableFeatures(srat, selection.method = "vst", nfeatures = 2000)
+srat <- ScaleData(srat)
+srat <- RunPCA(srat, features = VariableFeatures(object = srat))
+srat <- RunHarmony(srat,group.by.vars='orig.ident',plot_covergence=TRUE)
+srat <- RunUMAP(srat, dims = 1:20, reduction = 'harmony')
+srat <- FindNeighbors(srat, dims = 1:20,reduction = 'harmony')
+srat <- FindClusters(srat, resolution = 0.5)
+DimPlot(srat,reduction = 'umap',label = T,repel = T,pt.size = 0.5,label.size = 5)+NoLegend()
+all.markers <- FindAllMarkers(srat, only.pos = T,logfc.threshold = 0.25,min.pct = 0.25)
+mks<-all.markers%>%group_by(cluster)%>%top_n(n=20,wt=avg_log2FC)
+srat$group <- ifelse(str_detect(srat@meta.data$orig.ident, "HD"),
+                     "Disease","Normal")
+DimPlot(srat,group.by = 'group')
+new.cluster.ids <- c( "Microglial cell", "Microglial cell","Microglial cell", "Oligodendrocyte", "Astrocyte", "Microglial cell","Neuron","Microglial cell","Oligodendrocyte", "Astrocyte", "Microglial cell")
+names(new.cluster.ids) <- levels(srat)
+srat <- RenameIdents(srat, new.cluster.ids)
+DimPlot(srat, label = TRUE, pt.size = 0.5,repel = TRUE) + NoLegend()
+DotPlot(srat,features = c('RPS28','RPL39','PCDH9','PTPRD','PARD3B','DLGAP1','MAP1B','SOX11'),cols = c('green','red'))+RotatedAxis()
+cell_counts<-table(Idents(srat))
+cell.all<-cbind(cell_counts=cell_counts,cell_Freq=round(prop.table(cell_counts)*100,2))
+cell.num.group<-table(Idents(srat),srat$group)
+cell.freq.group<-round(prop.table(cell.num.group,margin = 2)*100,2)
+cell.all<-cbind(cell.all,cell.num.group,cell.freq.group)
+cell.all<-cell.all[,c(1,3,4,2,5,6)]
+colnames(cell.all)=paste(rep(c('All','Disease','Normal'),times=2),rep(c('count','freq'),each=3),sep = '_')
+data<-cell.all[,c('Normal_freq','Disease_freq')]
+data<-melt(data)
+colnames(data)<-c('celltype','type','count')
+p<-ggplot(data,aes(x=type,y=count,fill=celltype))+geom_bar(stat = 'identity',position = 'fill',width = 0.9)+theme(panel.grid = element_blank(),panel.background = element_blank())
+p
+m_markers<-FindMarkers(srat,ident.1 = 'Disease',group.by = 'group',min.pct=0.25,logfc.threshold=0.25,verbose=F)
+logFC = 0.25
+P.Value = 0.05
+k1 <- (m_markers$p_val < P.Value) & (m_markers$avg_log2FC < -logFC)
+k2 <- (m_markers$p_val < P.Value) & (m_markers$avg_log2FC > logFC)
+DEG_limma <- mutate(m_markers, change = ifelse(k1, "down", ifelse(k2, "up", "stable")))
+table(DEG_limma$change)
+p<-ggplot(data=DEG_limma,aes(x=avg_log2FC,y=-log10(p_val)))+geom_point(alpha=0.4,size=2,aes(color=change))+ylab('-log10(P.Val)')+scale_color_manual(values = c('blue4','red3'))+geom_vline(xintercept = c(-logFC,logFC),lty=4,col='black',lwd=0.8)+geom_hline(yintercept = -log10(P.Value),lty=4,col='black',lwd=0.8)+theme_bw()
+DEG_limma$ID<-rownames(DEG_limma)
+up_data<-filter(DEG_limma,change=='up')%>%distinct(ID,.keep_all = TRUE)%>%top_n(7,avg_log2FC)
+down_data<-filter(DEG_limma,change=='down')%>%distinct(ID,.keep_all = TRUE)%>%top_n(7,-avg_log2FC)
+p3<-p+geom_point(data=up_data,aes(x=avg_log2FC,y=-log10(p_val)),color='red3',size=4.5,alpha=0.2)+geom_label_repel(data=up_data,aes(x=avg_log2FC,y=-log10(p_val),label=ID),seed = 233,size=3.5,color='black',min.segment.length = 0,force=2,force_pull = 2,box.padding = 0.4,max.overlaps = Inf)+geom_point(data=down_data,aes(x=avg_log2FC,y=-log10(p_val)),color='blue4',size=4.5,alpha=0.2)+geom_label_repel(data=down_data,aes(x=avg_log2FC,y=-log10(p_val),label=ID),seed = 233,size=3.5,color='black',min.segment.length = 0,force=2,force_pull = 2,box.padding = 0.4,max.overlaps = Inf)
+p3
+df<-bitr(unique(rownames(m_markers)),fromType = "SYMBOL",toType = c('ENTREZID'),OrgDb = org.Hs.eg.db)
+m_markers$symbol<-rownames(m_markers)
+DEG<-merge(m_markers,df,by.y="SYMBOL",by.x='symbol')
+DEG1=DEG[,'ENTREZID']
+enrich.go<-enrichGO(gene = DEG1,OrgDb = org.Hs.eg.db,keyType = 'ENTREZID',ont = 'ALL',pvalueCutoff = 1,readable = T)
+barplot(enrich.go)
+
